@@ -524,3 +524,77 @@ class TestRealmLabsPostCall:
                 input_type="response",
             )
         assert result["texts"] == ["[name] was here"]
+
+
+# ---------------------------------------------------------------------------
+# config.yaml -> constructor wiring
+# ---------------------------------------------------------------------------
+
+
+class TestRealmLabsInitializer:
+    """Every field the config model documents must actually reach the class.
+
+    A field declared in the config model but dropped by initialize_guardrail is
+    silently ignored at runtime: the setting appears in config.yaml, the proxy
+    accepts it, and nothing happens.
+    """
+
+    @staticmethod
+    def _init(**litellm_param_kwargs):
+        from litellm.proxy.guardrails.guardrail_hooks.realmlabs import initialize_guardrail
+        from litellm.types.guardrails import LitellmParams
+
+        params = LitellmParams(guardrail="realmlabs", mode="pre_call", **litellm_param_kwargs)
+        with patch("litellm.logging_callback_manager.add_litellm_callback"):
+            return initialize_guardrail(params, {"guardrail_name": "realmlabs-guard"})
+
+    def test_all_config_fields_reach_the_guardrail(self):
+        guardrail = self._init(
+            api_key="cfg_key",
+            api_base="https://cfg.example.com",
+            probes=["hazard_prompt", "dispute"],
+            hazard_threshold=0.9,
+            pii=False,
+            pii_mask=False,
+            block_on_error=True,
+            default_on=True,
+        )
+        assert guardrail.api_key == "cfg_key"
+        assert guardrail.api_base == "https://cfg.example.com"
+        assert guardrail.probes == ["hazard_prompt", "dispute"]
+        assert guardrail.hazard_threshold == 0.9
+        assert guardrail.pii is False
+        assert guardrail.pii_mask is False
+        assert guardrail.block_on_error is True
+        assert guardrail.guardrail_name == "realmlabs-guard"
+
+    def test_optional_params_are_wired(self):
+        """enable_thinking/timeout live under optional_params and were dropped
+        by an earlier version of the initializer."""
+        guardrail = self._init(
+            api_key="k",
+            optional_params={"enable_thinking": True, "timeout": 42.0},
+        )
+        assert guardrail.enable_thinking is True
+        assert guardrail.timeout == 42.0
+
+    def test_optional_params_also_accepted_at_top_level(self):
+        guardrail = self._init(api_key="k", enable_thinking=True, timeout=7.5)
+        assert guardrail.enable_thinking is True
+        assert guardrail.timeout == 7.5
+
+    def test_defaults_apply_when_config_omits_them(self):
+        guardrail = self._init(api_key="k")
+        assert guardrail.api_base == "https://mls.realmlabs.ai"
+        assert guardrail.probes == ["hazard_prompt"]
+        assert guardrail.hazard_threshold == 0.703
+        assert guardrail.pii is True
+        assert guardrail.pii_mask is True
+        assert guardrail.block_on_error is False
+        assert guardrail.enable_thinking is False
+        assert guardrail.timeout == 15.0
+
+    def test_api_key_can_come_from_the_environment_instead(self):
+        with patch.dict(os.environ, {"REALMLABS_API_KEY": "from_env"}):
+            guardrail = self._init()
+        assert guardrail.api_key == "from_env"
