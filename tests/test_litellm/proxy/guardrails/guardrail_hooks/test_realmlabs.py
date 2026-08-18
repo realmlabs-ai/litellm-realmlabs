@@ -110,9 +110,11 @@ class TestRealmLabsGuardrailConfiguration:
         with patch.dict(os.environ, {}, clear=True), pytest.raises(RealmLabsMissingCredentials):
             RealmLabsGuardrail()
 
-    def test_only_pre_call_is_supported(self):
-        """Response-side scanning is not implemented yet."""
-        assert RealmLabsGuardrail.get_supported_event_hooks() == [GuardrailEventHooks.pre_call]
+    def test_both_hooks_are_supported(self):
+        assert RealmLabsGuardrail.get_supported_event_hooks() == [
+            GuardrailEventHooks.pre_call,
+            GuardrailEventHooks.post_call,
+        ]
 
     def test_config_model(self):
         assert RealmLabsGuardrailConfigModel.ui_friendly_name() == "RealmLabs MLS"
@@ -382,3 +384,143 @@ class TestRealmLabsRequestAndErrors:
                 input_type="request",
             )
         assert "unreachable" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# post_call
+# ---------------------------------------------------------------------------
+
+
+CONVERSATION = [
+    {"role": "system", "content": "You are helpful."},
+    {"role": "user", "content": "Hi, my name is Alex."},
+    {"role": "assistant", "content": "Hello!"},
+    {"role": "user", "content": "What is my name?"},
+]
+
+
+class TestRealmLabsPostCall:
+    @pytest.mark.asyncio
+    async def test_sends_full_conversation_plus_the_reply(self, realmlabs_guardrail):
+        """MLS is stateless: the whole conversation goes on every call, with the
+        model's reply appended as a trailing assistant turn."""
+        handler = MagicMock(post=AsyncMock(return_value=MagicMock(**{"json.return_value": _mls_response()})))
+        with patch.object(realmlabs_guardrail, "async_handler", handler):
+            await realmlabs_guardrail.apply_guardrail(
+                inputs={"texts": ["Your name is Alex."]},
+                request_data={"messages": CONVERSATION},
+                input_type="response",
+            )
+        sent = handler.post.call_args.kwargs["json"]["messages"]
+        assert sent == [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi, my name is Alex."},
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "user", "content": "What is my name?"},
+            {"role": "assistant", "content": "Your name is Alex."},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_is_included(self, realmlabs_guardrail):
+        """The chat template injects no system prompt of its own, so ours has to
+        be sent for the rendering - and therefore the offsets - to match."""
+        handler = MagicMock(post=AsyncMock(return_value=MagicMock(**{"json.return_value": _mls_response()})))
+        with patch.object(realmlabs_guardrail, "async_handler", handler):
+            await realmlabs_guardrail.apply_guardrail(
+                inputs={"texts": ["reply"]},
+                request_data={"messages": CONVERSATION},
+                input_type="response",
+            )
+        roles = [m["role"] for m in handler.post.call_args.kwargs["json"]["messages"]]
+        assert roles[0] == "system"
+
+    @pytest.mark.asyncio
+    async def test_multimodal_content_is_flattened_to_text(self, realmlabs_guardrail):
+        handler = MagicMock(post=AsyncMock(return_value=MagicMock(**{"json.return_value": _mls_response()})))
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+                ],
+            }
+        ]
+        with patch.object(realmlabs_guardrail, "async_handler", handler):
+            await realmlabs_guardrail.apply_guardrail(
+                inputs={"texts": ["a picture"]},
+                request_data={"messages": conversation},
+                input_type="response",
+            )
+        assert handler.post.call_args.kwargs["json"]["messages"][0] == {
+            "role": "user",
+            "content": "describe this",
+        }
+
+    @pytest.mark.asyncio
+    async def test_masks_pii_in_the_reply(self, realmlabs_guardrail):
+        body = _mls_response(pii_spans=[{"type": "name", "text": "Alex"}])
+        with _patch_mls(realmlabs_guardrail, body):
+            result = await realmlabs_guardrail.apply_guardrail(
+                inputs={"texts": ["Your name is Alex."]},
+                request_data={"messages": CONVERSATION},
+                input_type="response",
+            )
+        assert result["texts"] == ["Your name is [name]."]
+
+    @pytest.mark.asyncio
+    async def test_hazard_is_not_enforced_on_the_response(self, realmlabs_guardrail):
+        """hazard_prompt scores the user turn. On a response the focal turn is
+        the assistant's, so MLS reports role_mismatch and the score must not be
+        used to block the reply."""
+        body = _mls_response(hazard_prob=0.9999)
+        body["results"][0]["role_mismatch"] = True
+        body["focal_role"] = "assistant"
+        with _patch_mls(realmlabs_guardrail, body):
+            result = await realmlabs_guardrail.apply_guardrail(
+                inputs={"texts": ["some reply"]},
+                request_data={"messages": CONVERSATION},
+                input_type="response",
+            )
+        assert result["texts"] == ["some reply"]
+
+    @pytest.mark.asyncio
+    async def test_role_mismatch_also_suppresses_hazard_on_the_request(self, realmlabs_guardrail):
+        body = _mls_response(hazard_prob=0.9999)
+        body["results"][0]["role_mismatch"] = True
+        with _patch_mls(realmlabs_guardrail, body):
+            result = await realmlabs_guardrail.apply_guardrail(
+                inputs={"texts": ["hello"]},
+                request_data={"messages": [{"role": "user", "content": "hello"}]},
+                input_type="request",
+            )
+        assert result["texts"] == ["hello"]
+
+    @pytest.mark.asyncio
+    async def test_no_turn_id_is_ever_sent(self, realmlabs_guardrail):
+        """The endpoint is stateless - it stores nothing and takes no key."""
+        handler = MagicMock(post=AsyncMock(return_value=MagicMock(**{"json.return_value": _mls_response()})))
+        with patch.object(realmlabs_guardrail, "async_handler", handler):
+            for input_type, request_data in (
+                ("request", {"messages": CONVERSATION}),
+                ("response", {"messages": CONVERSATION}),
+            ):
+                await realmlabs_guardrail.apply_guardrail(
+                    inputs={"texts": ["x"]},
+                    request_data=request_data,
+                    input_type=input_type,
+                )
+        for call in handler.post.call_args_list:
+            assert "MLS_turn_id" not in call.kwargs["json"]
+
+    @pytest.mark.asyncio
+    async def test_reply_without_conversation_still_scans(self, realmlabs_guardrail):
+        """A missing/empty messages key must not silently skip the response."""
+        body = _mls_response(pii_spans=[{"type": "name", "text": "Alex"}])
+        with _patch_mls(realmlabs_guardrail, body):
+            result = await realmlabs_guardrail.apply_guardrail(
+                inputs={"texts": ["Alex was here"]},
+                request_data={},
+                input_type="response",
+            )
+        assert result["texts"] == ["[name] was here"]
