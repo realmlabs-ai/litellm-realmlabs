@@ -1,5 +1,3 @@
-from typing import Any
-
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
@@ -7,24 +5,25 @@ from .base import GuardrailConfigModel
 
 
 class RealmLabsProbeResult(TypedDict, total=False):
-    """One classifier probe verdict from the RealmLabs MLS response.
+    """One classifier probe verdict.
 
-    ``prob`` is the probe's score and ``threshold`` the cut-off MLS itself
-    considers meaningful. LiteLLM enforces ``hazard_threshold`` from the
-    guardrail config instead, so the two can differ.
+    Only the fields the guardrail acts on are modelled; MLS also returns
+    tuning detail (layer, span, pooling, window size) that callers do not
+    need, and extra keys are simply left untyped.
+
+    ``prob`` is the score and ``threshold`` the cut-off MLS itself considers
+    meaningful - the guardrail enforces ``hazard_threshold`` from its own
+    config instead, so the two can differ. ``role_mismatch`` is set when the
+    probe scored a turn whose role it was not trained for, e.g. hazard_prompt
+    (a user-turn probe) against the model's reply; such a score is not acted
+    on.
     """
 
     probe: str
     prob: float | None
     threshold: float | None
     decision: bool | None
-    expected_role: str | None
-    focal_role: str | None
     role_mismatch: bool | None
-    layer: int | None
-    span: str | None
-    pooling: str | None
-    n_window_tokens: int | None
 
 
 class RealmLabsPIISpan(TypedDict, total=False):
@@ -32,26 +31,25 @@ class RealmLabsPIISpan(TypedDict, total=False):
 
     ``start``/``end`` index MLS's rendered view of the whole conversation, not
     the individual message, so they are unusable for per-message masking and
-    are deliberately ignored. ``text`` is located within each message instead.
+    are deliberately ignored - ``text`` is located within each message instead.
     """
 
     type: str
+    text: str | None
     start: int | None
     end: int | None
-    text: str | None
-    score: float | None
 
 
 class RealmLabsGuardrailResponse(TypedDict, total=False):
-    """Response body of POST {api_base}/litellm/guardrail."""
+    """Response body of POST {api_base}/litellm/guardrail.
 
-    MLS_turn_id: str | None
+    The endpoint is stateless: it stores no conversation, so the response
+    carries no turn id or history count.
+    """
+
     results: list[RealmLabsProbeResult]
     focal_role: str | None
     pii_spans: list[RealmLabsPIISpan]
-    n_history_messages: int | None
-    model: dict[str, Any] | None
-    timings: dict[str, Any] | None
 
 
 class RealmLabsGuardrailOptionalParams(BaseModel):
