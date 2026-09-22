@@ -1,0 +1,48 @@
+# Example configuration for the RealmLabs MLS guardrail.
+#
+# Pass this file to the proxy with:  litellm --config <this file>
+
+model_list:
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+guardrails:
+  - guardrail_name: "realmlabs-guard"
+    litellm_params:
+      guardrail: realmlabs
+      # hazard_prompt scores the user turn, so it is enforced on pre_call only.
+      # post_call masks PII in the model's reply.
+      mode: [pre_call, post_call]
+      api_key: os.environ/REALMLABS_API_KEY   # or the REALMLABS_API_KEY env var alone
+      api_base: https://mls.realmlabs.ai      # /litellm/guardrail is appended automatically
+      default_on: true                        # false = callers opt in per request
+
+      # Which probes MLS runs. Only hazard_prompt's score is enforced.
+      probes: ["hazard_prompt"]
+      # Block when hazard_prompt scores strictly above this. Note the probe also
+      # responds to instruction-style phrasing ("repeat this back verbatim"), so
+      # raise it if benign traffic is being blocked.
+      hazard_threshold: 0.703
+
+      pii: true         # run MLS's PII detection head
+      pii_mask: true    # true = rewrite spans as [type]; false = block the call instead
+
+      # false (default) lets calls through when MLS is unreachable; true fails closed.
+      block_on_error: false
+
+      optional_params:
+        enable_thinking: false   # chat-template thinking mode
+        timeout: 15              # seconds
+
+# Apply to a single request instead of default_on:
+#
+# curl --location 'http://localhost:4000/chat/completions' \
+#   --header 'Authorization: Bearer sk-1234' \
+#   --header 'Content-Type: application/json' \
+#   --data '{
+#     "model": "claude-haiku-4-5",
+#     "messages": [{"role": "user", "content": "Test message"}],
+#     "guardrails": ["realmlabs-guard"]
+#   }'
